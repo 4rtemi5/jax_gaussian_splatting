@@ -42,6 +42,12 @@ mpl.rcParams["savefig.pad_inches"] = 0
 plt.style.use("dark_background")
 
 
+def downcast_safe(x, dtype, margin=0):
+    x = jnp.clip(x, jnp.finfo(dtype).min + margin, jnp.finfo(dtype).max - margin)
+    return x.astype(dtype)
+    
+
+
 @partial(jax.jit, static_argnames=["image_size", "channels"])
 def generate_2D_gaussian_splatting(
     sigma_x,
@@ -54,6 +60,8 @@ def generate_2D_gaussian_splatting(
     channels,
 ):
     dtype = rho.dtype
+    
+    
     batch_size = colors.shape[0]
     kernel_size = max(image_size)
     sigma_x = sigma_x.reshape((batch_size, 1, 1))
@@ -70,7 +78,6 @@ def generate_2D_gaussian_splatting(
             axis=-2,
         )
         .astype("float32")
-        .clip(min=0.0)
     )
 
     # Check for positive semi-definiteness
@@ -90,7 +97,6 @@ def generate_2D_gaussian_splatting(
 
     xy = jnp.stack([xx, yy], axis=-1)
     xy = xy + coords[:, None, None, :]
-    print(xy.shape)
 
     z = jnp.einsum("b...i,b...ij,b...j->b...", xy, -0.5 * inv_covariance, xy)
 
@@ -98,27 +104,32 @@ def generate_2D_gaussian_splatting(
         z, a_max=jnp.log(jnp.finfo(dtype).max)
     )  # mitigate overflow in fp16 mode
 
-    covariance_det = jnp.linalg.det(covariance)
-    covariance_det = jnp.where(
-        covariance_det < 0,
-        covariance_det + jnp.abs(covariance_det),
-        covariance_det,
-    )
+    # covariance_det = jnp.linalg.det(covariance)
+    # covariance_det = jnp.where(
+    #     covariance_det < 0,
+    #     covariance_det + jnp.abs(covariance_det),
+    #     covariance_det,
+    # )
+    
+    # kernel = (
+    #     jnp.exp(z)
+    #     / jnp.abs(
+    #         2 * jnp.pi * jnp.sqrt(covariance_det + 1e-6).reshape((batch_size, 1, 1))
+    #         + 1e-6
+    #     )
+    #     + 1e-6
+    # )
+    _, covariance_log_det = jnp.linalg.slogdet(covariance)
 
-    kernel = (
-        jnp.exp(z)
-        / jnp.abs(
-            2 * jnp.pi * jnp.sqrt(covariance_det + 1e-6).reshape((batch_size, 1, 1))
-            + 1e-6
-        )
-        + 1e-6
+    kernel = jnp.exp(
+        z 
+        - jnp.log(2*jnp.pi) 
+        + 0.5 * covariance_log_det.reshape((batch_size, 1, 1))
     )
 
     kernel_max = kernel.max(axis=[-1, -2], keepdims=True)
     kernel_max = jnp.where(kernel_max == 0, jnp.ones_like(kernel_max), kernel_max)
-    kernel_normalized = jnp.clip(
-        kernel / kernel_max, jnp.finfo(dtype).min + 100, jnp.finfo(dtype).max - 100
-    ).astype(dtype)
+    kernel_normalized = downcast_safe(kernel / kernel_max, dtype)
 
     kernel_reshaped = jnp.reshape(
         jnp.tile(kernel_normalized, (1, channels, 1)),
@@ -160,16 +171,20 @@ def generate_2D_gaussian_splatting(
     depth = jnp.ones(shape=(h, w))
 
     # Creating grid and performing grid sampling
-    pixel_coords = meshgrid(h, w, dtype=dtype)
+    pixel_coords = meshgrid(h, w, dtype=dtype)  # "float32")
     # Convert pixel coordinates to the camera frame
     cam_coords = pixel2cam(depth, pixel_coords, intrinsics[:3, :3])
 
     src_pixel_coords = cam2pixel(cam_coords, intrinsics)
+    
+    print(src_pixel_coords.shape)
 
     if channels == 4:
         mask_value = jnp.array([0.0, 0.0, 0.0, 0.0])
-    else:
+    elif channels == 3:
         mask_value = jnp.array([0.0, 0.0, 0.0])
+    else:
+        raise NotImplementedError 
 
     kernel_rgb_padded_translated = jax.vmap(
         lambda rgb: nearest_sampler(rgb, src_pixel_coords, mask_value=mask_value)
@@ -233,7 +248,7 @@ def ssim(img1, img2, window_size=11):
     C1 = 0.01**2
     C2 = 0.03**2
 
-    window = create_window(window_size, channels)  # .astype(img1.dtype)
+    window = create_window(window_size, channels)
 
     mu1 = conv2d(img1, window, padding=window_size // 2, groups=channels)
     mu2 = conv2d(img2, window, padding=window_size // 2, groups=channels)
@@ -345,9 +360,9 @@ class Splatter(keras.layers.Layer):
             colors = jnp.array(self.colors) * alpha
 
         return (
-            keras.ops.tanh(jnp.array(self.rho)).astype(self.config.dtype),
-            keras.ops.tanh(jnp.array(-self.sigma_x)).astype(self.config.dtype),
-            keras.ops.tanh(jnp.array(-self.sigma_y)).astype(self.config.dtype),
+            keras.ops.sigmoid(jnp.array(self.rho)).astype(self.config.dtype),
+            keras.ops.sigmoid(jnp.array(-self.sigma_x)).astype(self.config.dtype),
+            keras.ops.sigmoid(jnp.array(-self.sigma_y)).astype(self.config.dtype),
             keras.ops.tanh(jnp.array(self.coords)).astype(self.config.dtype),
             keras.ops.tanh(colors).astype(self.config.dtype),
             mask,
@@ -442,7 +457,7 @@ class SplatterModel(keras.Model):
         )
 
         # clean gradients
-        # grads = [jnp.where(jnp.isfinite(g), g, jnp.ones_like(g) * 0.01) for g in grads]
+        grads = [downcast_safe(g, self.config.dtype) for g in grads]
 
         # Update trainable variables and optimizer variables.
         (
@@ -459,7 +474,11 @@ class SplatterModel(keras.Model):
 
         for old_vars, new_vars in zip(trainable_variables, new_inits):
             cleaned_trainable_variables.append(
-                old_vars * mask + new_vars.astype(old_vars.dtype) * (1 - mask)
+                jnp.clip(
+                    old_vars * mask + new_vars.astype(old_vars.dtype) * (1 - mask),
+                    jnp.finfo(old_vars.dtype).min + 128,
+                    jnp.finfo(old_vars.dtype).max - 128,
+                )
             )
 
         # Update metrics.
@@ -557,7 +576,7 @@ for i in range(1, 50):
     # time.sleep(3 * i)
 
     original_image = Image.open(config.image_file_name)
-    original_image = original_image.resize(new_image_size, Image.BILINEAR)
+    original_image = original_image.resize(new_image_size, Image.NEAREST)  # Image.BILINEAR)
     if config.channels == 3:
         original_image = original_image.convert("RGB")
     elif config.channels == 4:
@@ -593,11 +612,10 @@ for i in range(1, 50):
         epochs=config.num_epochs,
         steps_per_epoch=config.steps_per_epoch,
         shuffle=False,
-        # callbacks=[image_callback],
+        callbacks=[image_callback],
     )
     # gc.collect()
-
-
+    
 # In[ ]:
 
 

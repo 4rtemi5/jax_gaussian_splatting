@@ -1,13 +1,13 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass
 class Config:
-    debug: bool = False
+    debug: bool = 1
     dtype: str = "float16"
     image_size: tuple[int] = (16, 16)
     channels: int = 3
-    num_samples: int = 2500
+    num_samples: int = 5000
     num_epochs: int = 10
     steps_per_epoch: int = 100
     learning_rate: float = 0.01  # 0.01
