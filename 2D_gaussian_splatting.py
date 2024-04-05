@@ -233,7 +233,7 @@ def init_values(samples, dtype="float32"):
     rho = jnp.ones((samples, 1), dtype=dtype)
     sigma_x = jnp.ones((samples, 1), dtype=dtype)
     sigma_y = jnp.ones((samples, 1), dtype=dtype)
-    coords = keras.initializers.RandomUniform(minval=-1.0, maxval=1.0)(
+    coords = keras.initializers.Constant(-1.0)(
         (samples, 2)
     ).astype(dtype)
     alpha = jnp.ones((samples, 1), dtype=dtype)
@@ -282,7 +282,7 @@ class Splatter(keras.layers.Layer):
         )
         self.alpha = self.add_weight(
             shape=(self.total_samples, 1),
-            initializer="ones",
+            initializer=keras.initializers.RandomUniform(minval=-1.0, maxval=0.0),
             trainable=True,
             dtype=self.params_dtype,
         )
@@ -295,10 +295,10 @@ class Splatter(keras.layers.Layer):
 
     def call(self, transform=None, training=False):
         transform = jnp.eye(4) if transform is None else transform
-        alpha = keras.ops.sigmoid(jnp.array(self.alpha))
-        mask = (alpha > (1 / 255)) | (keras.ops.sigmoid(jnp.array(self.rho)) < 1 / 255)
+        alpha = keras.ops.sigmoid(jnp.array(self.alpha)) * 1.2 - 0.1
+        mask = (alpha > 0.0) | (keras.ops.sigmoid(jnp.array(self.rho)) > (1 / 255))
         if self.config.channels == 4:
-            colors = keras.ops.concatenate([self.colors, alpha], axis=-1)
+            colors = keras.ops.concatenate([self.colors * alpha, alpha], axis=-1)
         else:
             colors = jnp.array(self.colors) * alpha
 
