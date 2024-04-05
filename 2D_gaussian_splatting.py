@@ -216,7 +216,7 @@ def l1_loss(pred, target):
 
 
 def psnr(pred, target):
-    psnr = -10.0 * jnp.log(((target - pred)**2).mean()) / jnp.log(10.0)
+    psnr = -10.0 * jnp.log(((target - pred) ** 2).mean()) / jnp.log(10.0)
     return psnr
 
 
@@ -296,8 +296,7 @@ class Splatter(keras.layers.Layer):
     def call(self, transform=None, training=False):
         transform = jnp.eye(4) if transform is None else transform
         alpha = keras.ops.sigmoid(jnp.array(self.alpha))
-        mask = alpha > 0.01
-        mask = mask | (keras.ops.sigmoid(jnp.array(self.rho)) < 0.01)
+        mask = (alpha > (1 / 255)) | (keras.ops.sigmoid(jnp.array(self.rho)) < 1 / 255)
         if self.config.channels == 4:
             colors = keras.ops.concatenate([self.colors, alpha], axis=-1)
         else:
@@ -337,7 +336,7 @@ class SplatterModel(keras.Model):
         super().__init__(**kwargs)
         self.config = config
         self.image_size = config.image_size
-        self.n_points = min(self.image_size[0] * self.image_size[1] - 1,128**2)
+        self.n_points = min(self.image_size[0] * self.image_size[1] - 1, 128**2)
         self.rng = jax.random.key(config.random_seed + sum(self.image_size))
         if splatter is None:
             self.splatter = Splatter(config)
@@ -392,7 +391,7 @@ class SplatterModel(keras.Model):
         # )
         # loss = combined_loss(splatted[None, ..., :], target, lambda_param=0.5)
         loss = -psnr(splatted[..., :3].flatten(), target[..., :3].flatten())
-            
+
         return loss, (splatted, mask[..., None], non_trainable_variables)
 
     def call(self, data, training=False):
@@ -404,13 +403,15 @@ class SplatterModel(keras.Model):
         if n == xy.shape[0]:
             return xy, target
         rng, seed_y = jax.random.split(rng, 2)
-        row_i = jax.random.choice(seed_y, xy.shape[0], shape=(n,), replace=False).astype("int32")
+        row_i = jax.random.choice(
+            seed_y, xy.shape[0], shape=(n,), replace=False
+        ).astype("int32")
         xy = jnp.take_along_axis(xy, row_i[..., None], axis=0)
 
         target = target.reshape((-1, target.shape[-1]))
         target = jnp.take_along_axis(target, row_i[..., None], axis=0)
         return xy, target, rng
-        
+
     def train_step(self, state, data):
         (
             trainable_variables,
@@ -427,11 +428,11 @@ class SplatterModel(keras.Model):
         x = jnp.tile(x[None, None, ...], (1, self.image_size[0], 1))
         y = jnp.arange(self.image_size[0], dtype="float32") / (self.image_size[1])
         y = jnp.tile(y[None, ..., None], (1, 1, self.image_size[1]))
-        xy = jnp.stack((x,y), axis=-1)
+        xy = jnp.stack((x, y), axis=-1)
         xy = xy.reshape((-1, 2))
 
         xy, target, self.rng = self.sample_n(xy, target, self.n_points, self.rng)
-        
+
         # Compute the gradients.
         (loss, (splatted, mask, non_trainable_variables)), grads = grad_fn(
             trainable_variables,
@@ -574,7 +575,7 @@ class ImageCallback(keras.callbacks.Callback):
         logs.pop("splatted")
         if logs["loss"] <= self.target_loss:
             self.model.stop_training = True
-    
+
     def on_test_batch_end(self, batch, logs):
         logs.pop("loss")
         self.target = logs.pop("target")
