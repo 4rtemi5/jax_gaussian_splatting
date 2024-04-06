@@ -128,7 +128,7 @@ def generate_2D_gaussian_splatting(
     )
 
     # print(kernel.shape)
-    kernel_max = kernel.max(axis=0, keepdims=True)  # axis=[-1, -2], keepdims=True)
+    kernel_max = kernel.max(axis=-1, keepdims=True)  # axis=[-1, -2], keepdims=True)
     # jax.debug.print("{kernel_max}", kernel_max=kernel_max)
     kernel = jnp.exp(kernel - kernel_max)
     # kernel = downcast_safe(kernel, dtype, margin=128)
@@ -310,7 +310,10 @@ class Splatter(keras.layers.Layer):
         alpha = keras.ops.sigmoid(jnp.array(self.alpha)) * 1.2 - 0.1
         mask = (alpha > 0.0) | (keras.ops.sigmoid(jnp.array(self.rho)) > (1 / 255))
         if self.config.channels == 4:
-            colors = keras.ops.concatenate([self.colors * alpha, alpha], axis=-1)
+            colors = keras.ops.concatenate([
+                self.colors * alpha,
+                alpha
+            ], axis=-1)
         else:
             colors = jnp.array(self.colors) * alpha
 
