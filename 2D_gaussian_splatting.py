@@ -53,7 +53,7 @@ def generate_2D_gaussian_splatting(
     colors,
     image_size,
     channels,
-    xy=None,
+    xy,
 ):
     dtype = rho.dtype
     batch_size = colors.shape[0]
@@ -103,15 +103,15 @@ def generate_2D_gaussian_splatting(
 
     inv_covariance = jnp.linalg.inv(covariance)
 
-    if xy is None:
-        # Creating a batch-wise meshgrid using broadcasting
-        x = jnp.arange(image_size[1], dtype="float32") / (image_size[1])
-        x = jnp.tile(x[None, None, ...], (1, image_size[0], 1))
-        y = jnp.arange(image_size[0], dtype="float32") / (image_size[1])
-        y = jnp.tile(y[None, ..., None], (1, 1, image_size[1]))
-    else:
-        x = xy[:, 0][None, None, ...]
-        y = xy[:, 1][None, None, ...]
+    # if xy is None:
+    #     # Creating a batch-wise meshgrid using broadcasting
+    #     x = jnp.arange(image_size[1], dtype="float32") / (image_size[1])
+    #     x = jnp.tile(x[None, None, ...], (1, image_size[0], 1))
+    #     y = jnp.arange(image_size[0], dtype="float32") / (image_size[1])
+    #     y = jnp.tile(y[None, ..., None], (1, 1, image_size[1]))
+    # else:
+    x = xy[:, 0][None, None, ...]
+    y = xy[:, 1][None, None, ...]
 
     ones = jnp.ones_like(x)
 
@@ -127,9 +127,11 @@ def generate_2D_gaussian_splatting(
         z - jnp.log(2 * jnp.pi) + 0.5 * covariance_log_det.reshape((batch_size, 1, 1))
     )
 
-    kernel_max = kernel.max(axis=[-1, -2], keepdims=True)
+    # print(kernel.shape)
+    kernel_max = kernel.max(axis=0, keepdims=True)  # axis=[-1, -2], keepdims=True)
+    # jax.debug.print("{kernel_max}", kernel_max=kernel_max)
     kernel = jnp.exp(kernel - kernel_max)
-    kernel = downcast_safe(kernel, dtype, margin=128)
+    # kernel = downcast_safe(kernel, dtype, margin=128)
 
     kernel = jnp.tile(
         kernel[..., None],
@@ -215,9 +217,19 @@ def l1_loss(pred, target):
     return jnp.abs(target - pred).mean()
 
 
-def psnr(pred, target):
-    psnr = -10.0 * jnp.log(((target - pred) ** 2).mean()) / jnp.log(10.0)
-    return psnr
+def rgb2ycbcr(im):
+    xform = jnp.array([[.299, .587, .114], [-.1687, -.3313, .5], [.5, -.4187, -.0813]])
+    ycbcr = im @ xform.T
+    y, cbcr = ycbcr[...,:1], ycbcr[...,1:] + 128
+    return jnp.concatenate([y, cbcr], axis=-1)
+
+
+def psnr_l1(pred, target):
+    # l1 = (jnp.abs(target - pred).sum(axis=-1)**2).mean()
+    pred = rgb2ycbcr(pred)
+    target = rgb2ycbcr(target)
+    psnr = -10.0 * jnp.log(((target[..., :] - pred[..., :]) ** 2).mean()) / jnp.log(10.0)
+    return - psnr #+ l1
 
 
 # Combined Loss
@@ -390,7 +402,7 @@ class SplatterModel(keras.Model):
         #     splatted,
         # )
         # loss = combined_loss(splatted[None, ..., :], target, lambda_param=0.5)
-        loss = -psnr(splatted[..., :3].flatten(), target[..., :3].flatten())
+        loss = psnr_l1(splatted[..., :3].reshape((-1, 3)), target[..., :3].reshape((-1, 3)))
 
         return loss, (splatted, mask[..., None], non_trainable_variables)
 
@@ -421,8 +433,6 @@ class SplatterModel(keras.Model):
         ) = state
         (intrinsics, transform, target) = data
 
-        # Get the gradient function.
-        grad_fn = jax.value_and_grad(self.compute_loss_and_updates, has_aux=True)
 
         x = jnp.arange(self.image_size[1], dtype="float32") / (self.image_size[1])
         x = jnp.tile(x[None, None, ...], (1, self.image_size[0], 1))
@@ -432,6 +442,9 @@ class SplatterModel(keras.Model):
         xy = xy.reshape((-1, 2))
 
         xy, target, self.rng = self.sample_n(xy, target, self.n_points, self.rng)
+        
+        # Get the gradient function.
+        grad_fn = jax.value_and_grad(self.compute_loss_and_updates, has_aux=True)
 
         # Compute the gradients.
         (loss, (splatted, mask, non_trainable_variables)), grads = grad_fn(
@@ -511,18 +524,30 @@ class SplatterModel(keras.Model):
         )
         rho, sigma, coords, colors, mask = pred
 
-        splatted = generate_2D_gaussian_splatting(
+        x = jnp.arange(self.image_size[1], dtype="float32") / (self.image_size[1])
+        x = jnp.tile(x[None, None, ...], (1, self.image_size[0], 1))
+        y = jnp.arange(self.image_size[0], dtype="float32") / (self.image_size[1])
+        y = jnp.tile(y[None, ..., None], (1, 1, self.image_size[1]))
+        xy = jnp.stack((x, y), axis=-1)
+        xy = xy.reshape((-1, 2))
+
+        batch_size = min(xy.shape[0], 128**2)
+        xys = jnp.array_split(xy, xy.shape[0] // batch_size, axis=0)
+
+        splatted = [generate_2D_gaussian_splatting(
             sigma,
             rho,
             coords,
             colors,
             self.image_size,
             target.shape[-1],
-            xy=None,
-        )
+            xy=batch,
+        ) for batch in xys]
+        splatted = jnp.concatenate(splatted, axis=0)
+        splatted = splatted.reshape((1, *self.image_size, -1))
         splatted, depth = splatted[..., :3], splatted[..., -1]
 
-        loss = -psnr(splatted, target[..., :3])
+        loss = psnr_l1(splatted.reshape((-1, 3)), target[..., :3].reshape((-1, 3)))
 
         # Update metrics.
         loss_tracker_vars = metrics_variables[: len(self.loss_tracker.variables)]

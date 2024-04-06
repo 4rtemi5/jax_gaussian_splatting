@@ -5,7 +5,7 @@ from dataclasses import dataclass
 class Config:
     debug: bool = 0
     dtype: str = "float32"
-    image_size: tuple[int] = (16, 16)
+    image_size: tuple[int] = (256, 256)  # (16, 16)
     target_size: int = 1024
     channels: int = 4
     num_samples: int = 4096
