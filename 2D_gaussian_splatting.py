@@ -6,12 +6,14 @@
 import os
 
 os.environ["KERAS_BACKEND"] = "jax"
-os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "true"
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "true"  # "false"
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "1.0"
+# os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
 
 # In[2]:
 # import gc
 # import time
+import random
 from config_2d import Config
 
 # from typing import List
@@ -55,15 +57,16 @@ def generate_2D_gaussian_splatting(
     channels,
     xy,
 ):
+
     dtype = rho.dtype
     batch_size = colors.shape[0]
-    sigma_x = sigma[:, 0:1].reshape((batch_size, 1, 1))
-    sigma_y = sigma[:, 1:2].reshape((batch_size, 1, 1))
-    sigma_z = sigma[:, 2:3].reshape((batch_size, 1, 1))
+    sigma_x = sigma[:, 0:1, None]  # .reshape((batch_size, 1, 1))
+    sigma_y = sigma[:, 1:2, None]  # .reshape((batch_size, 1, 1))
+    sigma_z = sigma[:, 2:3, None]  # .reshape((batch_size, 1, 1))
     # sigma_z = sigma[:, 2:3].reshape((batch_size, 1, 1))
     # coords = coords[:, :2]
 
-    eps = 1e-4
+    eps = 1e-6
 
     # sigma = sigma.reshape((batch_size, 1, 3))[:, :, :2]
     rho = rho.reshape((batch_size, 1, 1)) + eps
@@ -110,13 +113,17 @@ def generate_2D_gaussian_splatting(
     #     y = jnp.arange(image_size[0], dtype="float32") / (image_size[1])
     #     y = jnp.tile(y[None, ..., None], (1, 1, image_size[1]))
     # else:
-    x = xy[:, 0][None, None, ...]
-    y = xy[:, 1][None, None, ...]
+
+    x = xy[:, 0][None, ...]
+    y = xy[:, 1][None, ...]
 
     ones = jnp.ones_like(x)
 
     xy = jnp.stack([x, y, ones], axis=-1)
-    xy = xy + coords[:, None, None, :3]
+    # print(xy.shape, coords.shape)
+    xy = xy[0] + coords[:, None, :3]
+
+    # print(xy.shape, inv_covariance.shape)
 
     z = jnp.einsum("b...i,b...ij,b...j->b...", xy, -0.5 * inv_covariance, xy)
 
@@ -124,22 +131,26 @@ def generate_2D_gaussian_splatting(
     covariance_log_det = jnp.log(jnp.linalg.det(covariance))
 
     kernel = (
-        z - jnp.log(2 * jnp.pi) + 0.5 * covariance_log_det.reshape((batch_size, 1, 1))
+        z
+        - jnp.log(2 * jnp.pi)
+        + 0.5 * covariance_log_det.reshape((batch_size, 1))
     )
 
-    # print(kernel.shape)
-    kernel_max = kernel.max(axis=-1, keepdims=True)  # axis=[-1, -2], keepdims=True)
-    # jax.debug.print("{kernel_max}", kernel_max=kernel_max)
+    kernel_max = kernel.max(axis=0, keepdims=True)  # axis=[-1, -2], keepdims=True)
     kernel = jnp.exp(kernel - kernel_max)
     # kernel = downcast_safe(kernel, dtype, margin=128)
 
     kernel = jnp.tile(
         kernel[..., None],
-        (1, 1, 1, channels + 1),
+        (1, channels),
     )
 
-    rgb_values_reshaped = colors[..., None, None, :]
-    rgb_kernel = (kernel * rgb_values_reshaped).sum(axis=0, keepdims=True)
+    rgb_values_reshaped = colors[..., None, :3]
+    alpha_values_reshaped = colors[..., None, -1:]
+    
+    rgb_kernel = (kernel * rgb_values_reshaped * alpha_values_reshaped) / jnp.sum(alpha_values_reshaped, axis=1, keepdims=True)
+    
+    rgb_kernel = rgb_kernel.sum(axis=0, keepdims=True)
 
     return rgb_kernel  # final_image
 
@@ -218,9 +229,11 @@ def l1_loss(pred, target):
 
 
 def rgb2ycbcr(im):
-    xform = jnp.array([[.299, .587, .114], [-.1687, -.3313, .5], [.5, -.4187, -.0813]])
+    xform = jnp.array(
+        [[0.299, 0.587, 0.114], [-0.1687, -0.3313, 0.5], [0.5, -0.4187, -0.0813]]
+    )
     ycbcr = im @ xform.T
-    y, cbcr = ycbcr[...,:1], ycbcr[...,1:] + 128
+    y, cbcr = ycbcr[..., :1], ycbcr[..., 1:] + 128
     return jnp.concatenate([y, cbcr], axis=-1)
 
 
@@ -228,8 +241,10 @@ def psnr_l1(pred, target):
     # l1 = (jnp.abs(target - pred).sum(axis=-1)**2).mean()
     pred = rgb2ycbcr(pred)
     target = rgb2ycbcr(target)
-    psnr = -10.0 * jnp.log(((target[..., :] - pred[..., :]) ** 2).mean()) / jnp.log(10.0)
-    return - psnr #+ l1
+    psnr = (
+        -10.0 * jnp.log(((target[..., :] - pred[..., :]) ** 2).mean()) / jnp.log(10.0)
+    )
+    return -psnr  # + l1
 
 
 # Combined Loss
@@ -245,9 +260,7 @@ def init_values(samples, dtype="float32"):
     rho = jnp.ones((samples, 1), dtype=dtype)
     sigma_x = jnp.ones((samples, 1), dtype=dtype)
     sigma_y = jnp.ones((samples, 1), dtype=dtype)
-    coords = keras.initializers.Constant(-1.0)(
-        (samples, 2)
-    ).astype(dtype)
+    coords = keras.initializers.RandomUniform(minval=0.0, maxval=1.0)((samples, 2)).astype(dtype)
     alpha = jnp.ones((samples, 1), dtype=dtype)
     colors = jnp.zeros((samples, 3), dtype=dtype)
     return rho, sigma_x, sigma_y, coords, alpha, colors
@@ -288,7 +301,7 @@ class Splatter(keras.layers.Layer):
         # )
         self.coords = self.add_weight(
             shape=(self.total_samples, 3),
-            initializer=keras.initializers.RandomUniform(minval=-1.0, maxval=1.0),
+            initializer=keras.initializers.RandomUniform(minval=0.0, maxval=1.0),
             trainable=True,
             dtype=self.params_dtype,
         )
@@ -299,23 +312,22 @@ class Splatter(keras.layers.Layer):
             dtype=self.params_dtype,
         )
         self.colors = self.add_weight(
-            shape=(self.total_samples, 4),
+            shape=(self.total_samples, 3),
             initializer="zeros",
             trainable=True,
             dtype=self.params_dtype,
         )
+        self.build = True
 
     def call(self, transform=None, training=False):
+        # transform, (intrinsics, xy, target) = data
         transform = jnp.eye(4) if transform is None else transform
         alpha = keras.ops.sigmoid(jnp.array(self.alpha)) * 1.2 - 0.1
         mask = (alpha > 0.0) | (keras.ops.sigmoid(jnp.array(self.rho)) > (1 / 255))
-        if self.config.channels == 4:
-            colors = keras.ops.concatenate([
-                self.colors * alpha,
-                alpha
-            ], axis=-1)
-        else:
-            colors = jnp.array(self.colors) * alpha
+        # if self.config.channels == 4:
+        colors = keras.ops.concatenate([self.colors, alpha], axis=-1)
+        # else:
+            # colors = jnp.array(self.colors) * alpha
 
         return (
             keras.ops.sigmoid(jnp.array(self.rho)).astype(self.config.dtype),
@@ -351,7 +363,8 @@ class SplatterModel(keras.Model):
         super().__init__(**kwargs)
         self.config = config
         self.image_size = config.image_size
-        self.n_points = min(self.image_size[0] * self.image_size[1] - 1, 128**2)
+        self.batch_size = min(self.image_size[0] * self.image_size[1], 64**2)
+        self.multibatch = self.image_size[0] * self.image_size[1] > self.batch_size
         self.rng = jax.random.key(config.random_seed + sum(self.image_size))
         if splatter is None:
             self.splatter = Splatter(config)
@@ -369,8 +382,8 @@ class SplatterModel(keras.Model):
         non_trainable_variables,
         intrinsics,
         transform,
-        target,
         xy,
+        target,
         training=False,
     ):
         pred, non_trainable_variables = self.stateless_call(
@@ -381,6 +394,30 @@ class SplatterModel(keras.Model):
         )
         rho, sigma, coords, colors, mask = pred
 
+        # if self.multibatch:
+        #     xys = jnp.split(xy, xy.shape[0] // self.batch_size, axis=0)
+        #     xys = jnp.stack(xys, axis=0)
+        #     print(xys.shape)
+    
+        #     _, splatted = jax.lax.scan(
+        #         lambda carry, batch: (
+        #             carry,
+        #             generate_2D_gaussian_splatting(
+        #                 sigma,
+        #                 rho,
+        #                 coords,
+        #                 colors,
+        #                 self.image_size,
+        #                 target.shape[-1],
+        #                 xy=batch,
+        #             ),
+        #         ),
+        #         init=None,
+        #         xs=xys,
+        #         unroll=False,
+        #     )
+        #     splatted = splatted.reshape(1, *self.image_size, -1)
+        # else:
         splatted = generate_2D_gaussian_splatting(
             sigma,
             rho,
@@ -390,7 +427,8 @@ class SplatterModel(keras.Model):
             target.shape[-1],
             xy,
         )
-        splatted, depth = splatted[..., :3], splatted[..., -1]
+        splatted = splatted[..., :3]
+        # depth = splatted[..., -1]
         # splatted = transforms.apply_transform(
         #     splatted,
         #     transform=intrinsics,
@@ -405,27 +443,29 @@ class SplatterModel(keras.Model):
         #     splatted,
         # )
         # loss = combined_loss(splatted[None, ..., :], target, lambda_param=0.5)
-        loss = psnr_l1(splatted[..., :3].reshape((-1, 3)), target[..., :3].reshape((-1, 3)))
+        loss = psnr_l1(
+            splatted[..., :3].reshape((-1, 3)), target[..., :3].reshape((-1, 3))
+        )
 
         return loss, (splatted, mask[..., None], non_trainable_variables)
 
-    def call(self, data, training=False):
-        return self.splatter(data)
+    def call(self, transform, training=False):
+        return self.splatter(transform, training=training)
 
-    @staticmethod
-    @partial(jax.jit, static_argnames=["xy", "target", "n"])
-    def sample_n(xy, target, n, rng):
-        if n == xy.shape[0]:
-            return xy, target
-        rng, seed_y = jax.random.split(rng, 2)
-        row_i = jax.random.choice(
-            seed_y, xy.shape[0], shape=(n,), replace=False
-        ).astype("int32")
-        xy = jnp.take_along_axis(xy, row_i[..., None], axis=0)
+    # @staticmethod
+    # @partial(jax.jit, static_argnames=["xy", "target", "n"])
+    # def sample_n(xy, target, n, rng):
+    #     if n == xy.shape[0]:
+    #         return xy, target
+    #     rng, seed_y = jax.random.split(rng, 2)
+    #     row_i = jax.random.choice(
+    #         seed_y, xy.shape[0], shape=(n,), replace=False
+    #     ).astype("int32")
+    #     xy = jnp.take_along_axis(xy, row_i[..., None], axis=0)
 
-        target = target.reshape((-1, target.shape[-1]))
-        target = jnp.take_along_axis(target, row_i[..., None], axis=0)
-        return xy, target, rng
+    #     target = target.reshape((-1, target.shape[-1]))
+    #     target = jnp.take_along_axis(target, row_i[..., None], axis=0)
+    #     return xy, target, rng
 
     def train_step(self, state, data):
         (
@@ -434,35 +474,38 @@ class SplatterModel(keras.Model):
             optimizer_variables,
             metrics_variables,
         ) = state
-        (intrinsics, transform, target) = data
+        transform, (intrinsics, xy, target) = data
 
+        # x = jnp.arange(self.image_size[1], dtype="float32") / (self.image_size[1])
+        # x = jnp.tile(x[None, None, ...], (1, self.image_size[0], 1))
+        # y = jnp.arange(self.image_size[0], dtype="float32") / (self.image_size[1])
+        # y = jnp.tile(y[None, ..., None], (1, 1, self.image_size[1]))
+        # xy = jnp.stack((x, y), axis=-1)
+        # xy = xy.reshape((-1, 2))
+        # xy_batches = jnp.array_split(xy, xy.shape[0] // self.batch_size, axis=0)
+        # target_batches = jnp.array_split(target.reshape((-1, target.shape[-1])), xy.shape[0] // self.batch_size, axis=0)
 
-        x = jnp.arange(self.image_size[1], dtype="float32") / (self.image_size[1])
-        x = jnp.tile(x[None, None, ...], (1, self.image_size[0], 1))
-        y = jnp.arange(self.image_size[0], dtype="float32") / (self.image_size[1])
-        y = jnp.tile(y[None, ..., None], (1, 1, self.image_size[1]))
-        xy = jnp.stack((x, y), axis=-1)
-        xy = xy.reshape((-1, 2))
+        # # xy, target, self.rng = self.sample_n(xy, target, self.n_points, self.rng)
 
-        xy, target, self.rng = self.sample_n(xy, target, self.n_points, self.rng)
-        
         # Get the gradient function.
         grad_fn = jax.value_and_grad(self.compute_loss_and_updates, has_aux=True)
 
+        
         # Compute the gradients.
         (loss, (splatted, mask, non_trainable_variables)), grads = grad_fn(
             trainable_variables,
             non_trainable_variables,
             intrinsics,
             transform,
+            xy,
             target,
             # pose,
-            xy,
             training=True,
         )
+        # grads = jax.tree_util.tree_map(lambda *args: sum(args), *gradients)
 
         # clean gradients
-        grads = [downcast_safe(g, self.config.dtype) for g in grads]
+        # grads = [downcast_safe(g, self.config.dtype) for g in grads]
 
         # Update trainable variables and optimizer variables.
         (
@@ -475,16 +518,16 @@ class SplatterModel(keras.Model):
         new_inits = init_values(self.config.num_samples)
         mask = mask.astype("float32")
 
-        cleaned_trainable_variables = []
+        # cleaned_trainable_variables = []
 
-        for old_vars, new_vars in zip(trainable_variables, new_inits):
-            cleaned_trainable_variables.append(
-                jnp.clip(
-                    old_vars * mask + new_vars.astype(old_vars.dtype) * (1 - mask),
-                    jnp.finfo(old_vars.dtype).min + 128,
-                    jnp.finfo(old_vars.dtype).max - 128,
-                )
-            )
+        # for old_vars, new_vars in zip(trainable_variables, new_inits):
+        #     cleaned_trainable_variables.append(
+        #         jnp.clip(
+        #             old_vars * mask + new_vars.astype(old_vars.dtype) * (1 - mask),
+        #             jnp.finfo(old_vars.dtype).min + 128,
+        #             jnp.finfo(old_vars.dtype).max - 128,
+        #         )
+        #     )
 
         # Update metrics.
         loss_tracker_vars = metrics_variables[: len(self.loss_tracker.variables)]
@@ -513,7 +556,7 @@ class SplatterModel(keras.Model):
 
     def test_step(self, state, data):
         # Unpack the data.
-        (intrinsics, transform, target) = data
+        transform, (intrinsics, xys, target) = data
         (
             trainable_variables,
             non_trainable_variables,
@@ -527,28 +570,34 @@ class SplatterModel(keras.Model):
         )
         rho, sigma, coords, colors, mask = pred
 
-        x = jnp.arange(self.image_size[1], dtype="float32") / (self.image_size[1])
-        x = jnp.tile(x[None, None, ...], (1, self.image_size[0], 1))
-        y = jnp.arange(self.image_size[0], dtype="float32") / (self.image_size[1])
-        y = jnp.tile(y[None, ..., None], (1, 1, self.image_size[1]))
-        xy = jnp.stack((x, y), axis=-1)
-        xy = xy.reshape((-1, 2))
+        # x = jnp.arange(self.image_size[1], dtype="float32") / (self.image_size[1])
+        # x = jnp.tile(x[None, None, ...], (1, self.image_size[0], 1))
+        # y = jnp.arange(self.image_size[0], dtype="float32") / (self.image_size[1])
+        # y = jnp.tile(y[None, ..., None], (1, 1, self.image_size[1]))
+        # xy = jnp.stack((x, y), axis=-1)
+        # xy = xy.reshape((-1, 2))
 
-        batch_size = min(xy.shape[0], 128**2)
-        xys = jnp.array_split(xy, xy.shape[0] // batch_size, axis=0)
+        # batch_size = min(xy.shape[0], 64**2)
+        # xys = jnp.array_split(xy, xy.shape[0] // batch_size, axis=0)
 
-        splatted = [generate_2D_gaussian_splatting(
-            sigma,
-            rho,
-            coords,
-            colors,
-            self.image_size,
-            target.shape[-1],
-            xy=batch,
-        ) for batch in xys]
+        splatted = [
+            generate_2D_gaussian_splatting(
+                sigma,
+                rho,
+                coords,
+                colors,
+                self.image_size,
+                target[0].shape[-1],
+                xy=xy,
+            ) for xy in xys
+        ]
         splatted = jnp.concatenate(splatted, axis=0)
         splatted = splatted.reshape((1, *self.image_size, -1))
-        splatted, depth = splatted[..., :3], splatted[..., -1]
+        splatted = splatted[..., :3]
+        # depth = splatted[..., -1]
+        
+        target = jnp.concatenate(target, axis=0)
+        target = target.reshape((*self.image_size, -1))
 
         loss = psnr_l1(splatted.reshape((-1, 3)), target[..., :3].reshape((-1, 3)))
 
@@ -617,7 +666,7 @@ class ImageCallback(keras.callbacks.Callback):
         ax.set_axis_off()
         fig.add_axes(ax)
 
-        ax.imshow(jnp.clip(self.target[0], 0.0, 1.0), aspect="auto")
+        ax.imshow(jnp.clip(self.target, 0.0, 1.0), aspect="auto")
         fig.savefig(f"./results/target.png")
         plt.clf()
         plt.close()
@@ -643,7 +692,7 @@ class ImageCallback(keras.callbacks.Callback):
 # geometric augmentations
 
 
-def data_gen(image_in, target_size, seed=0):
+def data_gen(image_in, target_size, batch_size=64 ** 2, full_batch=False, seed=0):
     key = jax.random.PRNGKey(seed)
     augment = 0
 
@@ -707,18 +756,46 @@ def data_gen(image_in, target_size, seed=0):
             # augmented_original = Image.fromarray(np.uint8(image_in))
 
             augmented_original = augmented_original.resize(target_size, Image.BILINEAR)
-            image = np.array(augmented_original) / 255.0
+            target = np.array(augmented_original) / 255.0
             transform = np.linalg.inv(target_intrinsics) @ transform
             intrinsics = target_intrinsics
 
         else:
-            image = Image.fromarray(np.uint8(image_in))
-            image = image.resize(target_size, Image.BILINEAR)
-            image = np.array(image) / 255.0
+            target = Image.fromarray(np.uint8(image_in))
+            target = target.resize(target_size, Image.BILINEAR)
+            target = np.array(target) / 255.0
             transform = np.linalg.inv(target_intrinsics) @ np.eye(4)
             intrinsics = target_intrinsics
 
-        yield intrinsics, transform, image[None, ...]
+        x = np.arange(target_size[1], dtype="float32") / (target_size[1])
+        x = np.tile(x[None, None, ...], (1, target_size[1], 1))
+        y = np.arange(target_size[0], dtype="float32") / (target_size[0])
+        y = np.tile(y[None, ..., None], (1, 1, target_size[0]))
+        xy = np.stack((x, y), axis=-1)
+        xy = xy.reshape((-1, 2))
+        target = target.reshape((-1, target.shape[-1]))
+        
+
+        if (xy.shape[0] // batch_size) >= 2.0:
+            if not full_batch:
+                indices = np.arange(xy.shape[0])[..., None]
+                np.random.shuffle(indices)
+                xy = np.take_along_axis(xy, indices, axis=0)
+                target = np.take_along_axis(target, indices, axis=0)
+            
+            xy_batches = np.array_split(xy, xy.shape[0] // batch_size, axis=0)
+            target_batches = np.array_split(target, xy.shape[0] // batch_size, axis=0)
+            
+            if full_batch:
+                yield transform, (intrinsics, xy_batches, target_batches)
+            else:
+                for target, xy in zip(target_batches, xy_batches):
+                    yield transform, (intrinsics, xy, target)
+        else:
+            if full_batch:
+                yield transform, (intrinsics, [xy], [target])
+            else:
+                yield transform, (intrinsics, xy, target)
 
 
 # data
@@ -766,27 +843,30 @@ for i in range(50):
 
     splatter.fit(
         data_gen(target, new_image_size, seed=i),
-        validation_data=data_gen(target, new_image_size, seed=i),
+        validation_data=data_gen(target, new_image_size, full_batch=True, seed=i),
         validation_steps=1,
         epochs=config.num_epochs,
         steps_per_epoch=config.steps_per_epoch,
-        shuffle=False,
+        shuffle=True,
         callbacks=[image_callback],
     )
     if new_image_size[0] >= config.target_size:
         print("Done training.")
         break
+    # del splatter
+    # del optimizer
 
 
 # display results:
 
-rho, sigma, coords, colors, mask = splatter(transform=None, training=False)
+rho, sigma, coords, colors, mask = splatter(transform=jnp.eye(3), training=False)
 trafo = transforms.rotate(rad=jnp.pi / 3)[:3, :3]
 
-coords = jnp.matmul(trafo, coords.T).T
-coords = coords[:, :2]
+coords = jnp.matmul(coords, trafo)
+# coords = coords[:, :2]
 
-sigma = jnp.matmul(trafo, sigma.T).T
+
+sigma = jnp.matmul(sigma, trafo)
 
 sigma_x, sigma_y = sigma[:, :1], sigma[:, 1:2]
 
