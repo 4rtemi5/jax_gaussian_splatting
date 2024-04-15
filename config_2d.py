@@ -10,7 +10,7 @@ class Config:
     image_size: tuple[int] = (16, 16)
     channels: int = 3
     num_samples: int = 4096 #* 2
-    num_epochs: int = 1  # 100
+    num_epochs: int = 100
     steps_per_epoch: int = 10000
     learning_rate: float = 0.0001
     image_file_name: str = "demo_image.png"
