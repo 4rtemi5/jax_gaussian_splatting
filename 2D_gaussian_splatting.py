@@ -48,13 +48,12 @@ def downcast_safe(x, dtype, margin=0):
 
 
 # @partial(jax.jit, static_argnames=["image_size", "channels", "xy"])
-@partial(jax.checkpoint, static_argnums=(-1, -2, -3))
 def generate_2D_gaussian_splatting(
     sigma,
     rho,
     coords,
-    alpha,
     colors,
+    alpha,
     image_size,
     channels,
     xy,
@@ -90,14 +89,14 @@ def generate_2D_gaussian_splatting(
                 ],
                 axis=-1,
             ),
-            # jnp.concatenate(
-            #     [
-            #         sigma_x * sigma_z * rho,
-            #         sigma_y * sigma_z * rho,
-            #         sigma_z * sigma_z + eps,
-            #     ],
-            #     axis=-1,
-            # ),
+        #     jnp.concatenate(
+        #         [
+        #             sigma_x * sigma_z * rho,
+        #             sigma_y * sigma_z * rho,
+        #             sigma_z**2 + eps,
+        #         ],
+        #         axis=-1,
+        #     ),
         ],
         axis=-2,
     ).astype("float32")
@@ -140,9 +139,10 @@ def generate_2D_gaussian_splatting(
     #     (1, channels),
     # )
     kernel = kernel[..., None]
+    # print(kernel.shape)
 
     rgb_values_reshaped = (
-        colors #* alpha
+        colors
     )[..., None, :3]
     alpha_values_reshaped = alpha[..., None, :]
 
@@ -150,14 +150,15 @@ def generate_2D_gaussian_splatting(
 
     # print(kernel.shape, rgb_values_reshaped.shape)
 
-    rgb_kernel = (kernel * rgb_values_reshaped)  #  / alpha_values_reshaped) 
+    rgb_kernel = (kernel * rgb_values_reshaped)  # alpha_values_reshaped) 
+
     #/ (
     #    jnp.sum(alpha_values_reshaped, axis=1, keepdims=True) + 1e-6
     #)
     # kernel = kernel / jnp.sum(kernel, axis=1, keepdims=True)
 
     # rgb_kernel = kernel * rgb_values_reshaped
-    rgb_kernel = (rgb_kernel).sum(axis=0) / (alpha_kernel.sum(0) + 1e-4)
+    rgb_kernel = (rgb_kernel / (alpha_kernel.sum(0, keepdims=True) + eps)).sum(0)
     # print(rgb_kernel.shape)
 
     return rgb_kernel  # final_image
@@ -263,23 +264,23 @@ def combined_loss(pred, target, lambda_param=0.5):
     )
 
 
-@partial(jax.jit, static_argnames=("samples"))
-def init_values(samples, dtype="float32"):
-    rho = jnp.ones((samples, 1), dtype=dtype)
-    # sigma = jnp.ones((samples, 3), dtype=dtype)
-    sigma = jnp.ones((samples, 2), dtype=dtype)
-    coords = keras.initializers.RandomUniform(minval=0.0, maxval=1.0)(
-        (samples, 3)
-    ).astype(dtype)
-    alpha = jnp.ones((samples, 1), dtype=dtype)
-    colors = jnp.zeros((samples, 3), dtype=dtype)
-    return (
-        rho,
-        sigma,
-        coords,
-        colors,
-        alpha,
-    )
+# @partial(jax.jit, static_argnames=("samples"))
+# def init_values(samples, dtype="float32"):
+#     rho = jnp.ones((samples, 1), dtype=dtype)
+#     # sigma = jnp.ones((samples, 3), dtype=dtype)
+#     sigma = jnp.ones((samples, 2), dtype=dtype)
+#     coords = keras.initializers.RandomUniform(minval=0.0, maxval=1.0)(
+#         (samples, 3)
+#     ).astype(dtype)
+#     alpha = jnp.ones((samples, 1), dtype=dtype)
+#     colors = jnp.zeros((samples, 3), dtype=dtype)
+#     return (
+#         rho,
+#         sigma,
+#         coords,
+#         colors,
+#         alpha,
+#     )
 
 
 class Splatter(keras.layers.Layer):
@@ -295,33 +296,33 @@ class Splatter(keras.layers.Layer):
             shape=(self.total_samples, 1),
             initializer="ones",
             trainable=True,
-            dtype=self.params_dtype,
+            # dtype=self.params_dtype,
         )
         self.sigma = self.add_weight(
             # shape=(self.total_samples, 3),
             shape=(self.total_samples, 2),
             initializer="normal",
             trainable=True,
-            dtype=self.params_dtype,
+            # dtype=self.params_dtype,
         )
         self.coords = self.add_weight(
             # shape=(self.total_samples, 3),
             shape=(self.total_samples, 2),
             initializer=keras.initializers.RandomUniform(minval=-1.0, maxval=1.0),
             trainable=True,
-            dtype=self.params_dtype,
+            # dtype=self.params_dtype,
         )
         self.alpha = self.add_weight(
             shape=(self.total_samples, 1),
             initializer="ones",  # keras.initializers.RandomUniform(minval=-1.0, maxval=1.0),
             trainable=True,
-            dtype=self.params_dtype,
+            # dtype=self.params_dtype,
         )
         self.colors = self.add_weight(
             shape=(self.total_samples, 3),
             initializer="ones",
             trainable=True,
-            dtype=self.params_dtype,
+            # dtype=self.params_dtype,
         )
         self.build = True
 
@@ -340,8 +341,8 @@ class Splatter(keras.layers.Layer):
 
         return (
             keras.ops.sigmoid(self.rho).astype(self.config.dtype),
-            (keras.ops.tanh(self.sigma) * 0.01).astype(self.config.dtype),
-            jnp.array(keras.ops.tanh(self.coords)).astype(self.config.dtype),
+            (jax.nn.tanh(jnp.array(self.sigma) / 2) + 1e-4).astype(self.config.dtype),
+            jnp.array(keras.ops.tanh(self.coords) - 0.5).astype(self.config.dtype),
             keras.ops.sigmoid(colors).astype(self.config.dtype),
             keras.ops.sigmoid(self.alpha).astype(self.config.dtype),
             mask,
@@ -411,7 +412,7 @@ class SplatterModel(keras.Model):
         # target = jnp.concatenate(target, axis=0).reshape((*image_size, -1))
 
         xy = jnp.stack(xy, axis=0)
-        print(xy.shape)
+        # print(xy.shape)
         
         splatting_fn = (lambda coord: generate_2D_gaussian_splatting(
             sigma,
@@ -519,8 +520,8 @@ class SplatterModel(keras.Model):
             optimizer_variables, grads, trainable_variables
         )
 
-        new_inits = init_values(self.config.num_samples)
-        mask = mask.astype("float32")
+        # new_inits = init_values(self.config.num_samples)
+        # mask = mask.astype("float32")
 
         # reg_factor = 1e-4
         # rho, sigma, coords, colors, alpha = trainable_variables
@@ -617,7 +618,7 @@ class SplatterModel(keras.Model):
             rho,
             coords,
             colors,
-            alpha, 
+            alpha,
             self.image_size,
             target.shape[-1],
             coord,
@@ -679,6 +680,19 @@ class ImageCallback(keras.callbacks.Callback):
         plt.clf()
         plt.close()
 
+    def on_train_end(self, logs=None):
+        fig = plt.figure(frameon=False)
+        fig.set_size_inches(5, 5)
+
+        ax = plt.Axes(fig, [0.0, 0.0, 1.0, 1.0])
+        ax.set_axis_off()
+        fig.add_axes(ax)
+
+        ax.imshow(jnp.clip(self.splatted[0], 0.0, 1.0), aspect="auto")
+        fig.savefig(f"./results/final.png")
+        plt.clf()
+        plt.close()
+
     def on_train_batch_end(self, batch, logs):
         logs.pop("target")
         logs.pop("splatted")
@@ -724,7 +738,7 @@ class ImageCallback(keras.callbacks.Callback):
 # geometric augmentations
 
 
-def data_gen(image_in, target_size, batch_size=128**2, randomize=False, seed=0):
+def data_gen(image_in, target_size, batch_size=64**2, randomize=False, seed=0):
     augment = 0
 
     height, width, _ = image_in.shape
@@ -890,37 +904,37 @@ for i in range(50):
         shuffle=True,
         callbacks=[image_callback],
     )
-    if new_image_size[0] >= config.target_size:
-        print("Done training.")
-        break
+    # if new_image_size[0] >= config.target_size:
+    print("Done training.")
+    break
     # del splatter
     # del optimizer
 
 
 # display results:
 
-rho, sigma, coords, colors, alpha, mask = splatter(transform=jnp.eye(3), training=False)
-trafo = transforms.rotate(rad=jnp.pi / 3)[:3, :3]
+# rho, sigma, coords, colors, alpha, mask = splatter(transform=jnp.eye(3), training=False)
+# # trafo = transforms.rotate(rad=jnp.pi / 3)[:3, :3]
 
-coords = jnp.matmul(coords, trafo)
-# coords = coords[:, :2]
+# # coords = jnp.matmul(coords, trafo)
+# # coords = coords[:, :2]
 
 
-sigma = jnp.matmul(sigma, trafo)
+# # sigma = jnp.matmul(sigma, trafo)
 
-sigma_x, sigma_y = sigma[:, :1], sigma[:, 1:2]
+# # sigma_x, sigma_y = sigma[:, :1], sigma[:, 1:2]
 
-final_image = generate_2D_gaussian_splatting(
-    sigma,
-    rho,
-    coords,
-    colors,
-    alpha, 
-    image_size=(config.target_size * 2, config.target_size * 2),
-    channels=3,
-)
+# final_image = generate_2D_gaussian_splatting(
+#     sigma,
+#     rho,
+#     coords,
+#     colors,
+#     alpha,
+#     image_size=(config.target_size * 2, config.target_size * 2),
+#     channels=3,
+# )
 
-plt.imshow(np.array(final_image.astype("float32")))
-plt.savefig(f"./final.png")
+# plt.imshow(np.array(final_image.astype("float32")))
+# plt.savefig(f"./final.png")
 
 print("Done.")
